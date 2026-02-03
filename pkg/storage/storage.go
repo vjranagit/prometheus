@@ -48,11 +48,13 @@ func DefaultConfig() *Config {
 
 // badgerStorage implements Storage using BadgerDB
 type badgerStorage struct {
-	cfg        *Config
-	db         *badger.DB
-	index      *Index
-	compressor *Compressor
-	mu         sync.RWMutex
+	cfg         *Config
+	db          *badger.DB
+	index       *Index
+	compressor  *Compressor
+	mu          sync.RWMutex
+	wal         *WAL
+	batchWriter *BatchWriter
 }
 
 // NewStorage creates a new storage instance
@@ -84,11 +86,42 @@ func NewStorage(cfg *Config) (Storage, error) {
 		compressor: compressor,
 	}
 
+	// Initialize WAL if enabled
+	if cfg.EnableWAL {
+		wal, err := NewWAL(cfg.Path)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to initialize WAL: %w", err)
+		}
+		s.wal = wal
+
+		// Replay WAL for crash recovery
+		if err := ReplayWAL(cfg.Path, func(req *types.WriteRequest) error {
+			return s.writeDirect(req)
+		}); err != nil {
+			wal.Close()
+			db.Close()
+			return nil, fmt.Errorf("WAL replay failed: %w", err)
+		}
+
+		// Initialize batch writer (buffer up to 1000 requests)
+		s.batchWriter = NewBatchWriter(s, wal, 1000)
+	}
+
 	return s, nil
 }
 
 // Write implements Storage.Write
 func (s *badgerStorage) Write(ctx context.Context, req *types.WriteRequest) error {
+	// Use batch writer if available
+	if s.batchWriter != nil {
+		return s.batchWriter.Write(req)
+	}
+	return s.writeDirect(req)
+}
+
+// writeDirect writes directly to storage (used by Write and WAL replay)
+func (s *badgerStorage) writeDirect(req *types.WriteRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -282,6 +315,17 @@ func (s *badgerStorage) readBlock(tenantID string, seriesID uint64, blockTime in
 
 // Close implements Storage.Close
 func (s *badgerStorage) Close() error {
+	// Close batch writer first
+	if s.batchWriter != nil {
+		s.batchWriter.Close()
+	}
+
+	// Close WAL
+	if s.wal != nil {
+		s.wal.Close()
+	}
+
+	// Close database
 	if s.db != nil {
 		return s.db.Close()
 	}
